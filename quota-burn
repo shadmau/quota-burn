@@ -1,0 +1,787 @@
+#!/usr/bin/env python3
+"""
+quota-burn — spend expiring AI quota on low-priority backlog work.
+
+Usage:
+  quota-burn check           Show status: idle, reset time, eligible tasks
+  quota-burn run-once        Run exactly one eligible backlog task (if policy allows)
+  quota-burn done            List completed once-tasks and loop-task pass counts
+  quota-burn reset <task>    Reset a task's state so it can run again
+
+Task types (set in backlog .md files):
+  type: once        Run exactly once, then done (default)
+  type: recurring   Run every eligible window, indefinitely
+  type: loop        Run up to max_passes times; each pass sees previous iteration context
+"""
+
+import sys
+import json
+import subprocess
+import time
+import re
+import fcntl
+from pathlib import Path
+from datetime import datetime
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+CONFIG_FILE = SCRIPT_DIR / "config.toml"
+STATE_FILE  = SCRIPT_DIR / "state.json"
+BACKLOG_DIR = SCRIPT_DIR / "backlog"
+LOCK_FILE   = SCRIPT_DIR / ".lock"
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+WINDOW_DAYS = 7  # Claude's rolling weekly usage window (7 × 24h)
+
+DEFAULTS = {
+    "policy": {
+        "reset_threshold_minutes": 60,
+        "idle_threshold_minutes":  10,
+        "max_tasks_per_run":       1,   # tasks to run back-to-back per cron invocation
+    },
+    "providers": {
+        "claude": {
+            "binary":           "claude",
+            "projects_dir":     "~/.claude/projects",
+            "plan_token_limit": 0,
+            "refresh_model":    "claude-haiku-4-5-20251001",
+            "default_model":    "",
+        },
+        "codex": {
+            "binary":        "codex",
+            "sessions_dir":  "~/.codex/sessions",
+            "refresh_model": "gpt-5.4-mini",  # cheapest Codex model for the ping
+            "default_model": "",              # leave empty = provider default (gpt-5.4)
+        },
+    },
+    "paths": {
+        "log": "~/.quota-burn/run.log",
+    },
+}
+
+
+def deep_merge(base, override):
+    result = base.copy()
+    for k, v in override.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+
+def load_config():
+    import copy
+    cfg = copy.deepcopy(DEFAULTS)
+    if not CONFIG_FILE.exists():
+        return cfg
+    try:
+        import tomllib
+    except ImportError:
+        try:
+            import tomli as tomllib  # pip install tomli on <3.11
+        except ImportError:
+            print("Warning: tomllib unavailable, using defaults", file=sys.stderr)
+            return cfg
+    with open(CONFIG_FILE, "rb") as f:
+        return deep_merge(cfg, tomllib.load(f))
+
+
+# ---------------------------------------------------------------------------
+# State  (simple JSON, auto-created)
+# ---------------------------------------------------------------------------
+
+def load_state():
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def save_state(state):
+    STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Lock  (prevents parallel runs)
+# ---------------------------------------------------------------------------
+
+def acquire_lock():
+    fh = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fh
+    except BlockingIOError:
+        fh.close()
+        return None
+
+
+def release_lock(fh):
+    fcntl.flock(fh, fcntl.LOCK_UN)
+    fh.close()
+    LOCK_FILE.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Claude provider  — idle from JSONL, reset/utilization from Anthropic API
+# ---------------------------------------------------------------------------
+
+CLAUDE_RL_CACHE_MAX_AGE = 3600  # re-fetch rate limits at most once per hour
+
+def _fetch_claude_rate_limits(cfg):
+    """
+    Call api.anthropic.com with the CLI's OAuth token and return the
+    7-day (and 5h) unified rate-limit headers.
+
+    The OAuth token lives in ~/.claude/.credentials.json and works as
+    an x-api-key with anthropic-beta: oauth-2025-04-20.
+
+    Returns a dict with keys resets_at_7d, util_7d, resets_at_5h, util_5h,
+    or None on any failure.
+    """
+    import urllib.request, urllib.error
+
+    creds_file = Path("~/.claude/.credentials.json").expanduser()
+    if not creds_file.exists():
+        return None
+    try:
+        token = json.loads(creds_file.read_text())["claudeAiOauth"]["accessToken"]
+    except Exception:
+        return None
+
+    model = cfg["providers"]["claude"].get("refresh_model", "claude-haiku-4-5-20251001")
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        method="POST",
+        headers={
+            "x-api-key":        token,
+            "Content-Type":     "application/json",
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta":   "oauth-2025-04-20",
+        },
+        data=json.dumps({
+            "model": model, "max_tokens": 1,
+            "messages": [{"role": "user", "content": "hi"}],
+        }).encode(),
+    )
+    try:
+        resp = urllib.request.urlopen(req, timeout=15)
+        h = dict(resp.headers)
+    except urllib.error.HTTPError as e:
+        h = dict(e.headers)   # headers arrive even on 4xx
+    except Exception:
+        return None
+
+    def hget(key):
+        return h.get(key) or h.get(key.lower())
+
+    r7d = hget("anthropic-ratelimit-unified-7d-reset")
+    u7d = hget("anthropic-ratelimit-unified-7d-utilization")
+    r5h = hget("anthropic-ratelimit-unified-5h-reset")
+    u5h = hget("anthropic-ratelimit-unified-5h-utilization")
+
+    if not r7d:
+        return None
+
+    return {
+        "resets_at_7d": int(r7d),
+        "util_7d":      float(u7d) if u7d else None,
+        "resets_at_5h": int(r5h)   if r5h else None,
+        "util_5h":      float(u5h) if u5h else None,
+    }
+
+
+def claude_status(cfg, state):
+    """
+    Returns (idle_minutes, reset_minutes, tokens_used, used_pct).
+
+    idle_minutes : from JSONL timestamps — accurate, works offline.
+    reset_minutes: from Anthropic API headers — exact, matches web UI.
+                   Cached in state for up to 1 hour.
+    used_pct     : API-reported 7d utilization (0–100 %).
+    """
+    projects = Path(cfg["providers"]["claude"]["projects_dir"]).expanduser()
+    now = time.time()
+
+    # --- Idle detection: scan JSONL for most recent message timestamp ---
+    latest_ts   = 0.0
+    tokens_used = 0
+    window_start = now - WINDOW_DAYS * 24 * 3600
+
+    if projects.exists():
+        for f in projects.rglob("*.jsonl"):
+            if f.stat().st_mtime < window_start - 86400:
+                continue
+            try:
+                for raw in f.read_text(errors="replace").splitlines():
+                    if not raw.strip():
+                        continue
+                    obj = json.loads(raw)
+                    ts_str = obj.get("timestamp")
+                    if not ts_str:
+                        continue
+                    ts = datetime.fromisoformat(
+                        ts_str.replace("Z", "+00:00")
+                    ).timestamp()
+                    if ts > latest_ts:
+                        latest_ts = ts
+                    if ts >= window_start:
+                        usage = obj.get("message", {}).get("usage", {})
+                        if usage:
+                            tokens_used += (
+                                usage.get("input_tokens", 0)
+                                + usage.get("output_tokens", 0)
+                                + usage.get("cache_creation_input_tokens", 0)
+                            )
+            except Exception:
+                continue
+
+    idle_minutes = (now - latest_ts) / 60 if latest_ts else None
+
+    # --- Rate limits: API (cached hourly) ---
+    cache = state.get("claude_rl_cache", {})
+    if now - cache.get("ts", 0) > CLAUDE_RL_CACHE_MAX_AGE:
+        print("  [claude] fetching rate limits from API...", file=sys.stderr)
+        rl = _fetch_claude_rate_limits(cfg)
+        if rl:
+            cache = {"ts": now, **rl}
+            state["claude_rl_cache"] = cache
+            save_state(state)
+
+    resets_at_7d = cache.get("resets_at_7d")
+    util_7d      = cache.get("util_7d")
+
+    if not resets_at_7d or resets_at_7d <= now:
+        return idle_minutes, None, tokens_used, None
+
+    reset_minutes = (resets_at_7d - now) / 60
+    used_pct      = util_7d * 100 if util_7d is not None else None
+
+    return idle_minutes, reset_minutes, tokens_used, used_pct
+
+
+# ---------------------------------------------------------------------------
+# Codex provider
+# ---------------------------------------------------------------------------
+
+CODEX_SESSION_MAX_AGE = 3600  # re-use session data if < 1h old
+
+def _codex_read_sessions(sessions_dir):
+    """
+    Scan ~/.codex/sessions/**/*.jsonl for the most recent token_count event.
+    Returns (latest_event_ts, best_rate_limits, best_event_ts).
+    """
+    now = time.time()
+    latest_event_ts  = 0.0
+    best_rate_limits = None
+    best_event_ts    = 0.0
+
+    files = sorted(sessions_dir.rglob("*.jsonl"),
+                   key=lambda f: f.stat().st_mtime, reverse=True)
+
+    for f in files:
+        if f.stat().st_mtime < now - 8 * 86400:
+            break
+        try:
+            for raw in f.read_text(errors="replace").splitlines():
+                if not raw.strip():
+                    continue
+                obj = json.loads(raw)
+                ts_str = obj.get("timestamp")
+                if not ts_str:
+                    continue
+                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
+                if ts > latest_event_ts:
+                    latest_event_ts = ts
+                payload = obj.get("payload", {})
+                if isinstance(payload, dict) and payload.get("type") == "token_count":
+                    rl = payload.get("rate_limits")
+                    if rl and ts > best_event_ts:
+                        best_event_ts    = ts
+                        best_rate_limits = rl
+        except Exception:
+            continue
+        if best_rate_limits and (now - best_event_ts) < 8 * 86400:
+            break
+
+    return latest_event_ts, best_rate_limits, best_event_ts
+
+
+def _run_hello(binary, extra_args, model=None, cwd="/tmp"):
+    """
+    Fire a minimal CLI request to get a fresh session file with rate_limits.
+    Uses the cheapest configured model and the shortest possible prompt.
+    """
+    cmd = [binary] + extra_args
+    if model:
+        cmd += ["--model", model]
+    cmd += ["hi"]   # 1 token — minimum viable prompt
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, timeout=30, cwd=cwd)
+    except Exception:
+        pass
+
+
+def codex_status(cfg, state):
+    """
+    Returns (idle_minutes, reset_minutes, tokens_used, used_pct).
+
+    If session data is stale (> CODEX_SESSION_MAX_AGE), fires a minimal
+    `codex exec` to refresh it — at most once per hour (tracked in state).
+    """
+    sessions_dir = Path(cfg["providers"]["codex"]["sessions_dir"]).expanduser()
+    if not sessions_dir.exists():
+        return None, None, 0, None
+
+    now = time.time()
+    latest_ts, best_rl, best_ts = _codex_read_sessions(sessions_dir)
+
+    data_age = now - best_ts if best_ts else float("inf")
+
+    if data_age > CODEX_SESSION_MAX_AGE:
+        last_refresh = state.get("codex_refresh_ts", 0)
+        if now - last_refresh > CODEX_SESSION_MAX_AGE:
+            print("  [codex] session data stale — running minimal refresh...",
+                  file=sys.stderr)
+            _run_hello(
+                cfg["providers"]["codex"]["binary"],
+                ["exec", "--skip-git-repo-check"],
+                model=cfg["providers"]["codex"].get("refresh_model"),
+            )
+            state["codex_refresh_ts"] = now
+            save_state(state)
+            # Re-read after refresh
+            latest_ts, best_rl, best_ts = _codex_read_sessions(sessions_dir)
+
+    idle_minutes = (now - latest_ts) / 60 if latest_ts else None
+
+    if not best_rl:
+        return idle_minutes, None, 0, None
+
+    secondary = best_rl.get("secondary", {})
+    resets_at = secondary.get("resets_at")
+    used_pct  = secondary.get("used_percent")
+
+    if not resets_at or resets_at <= now:
+        return idle_minutes, None, 0, 0.0
+
+    return idle_minutes, (resets_at - now) / 60, 0, used_pct
+
+
+# ---------------------------------------------------------------------------
+# Provider dispatcher
+# ---------------------------------------------------------------------------
+
+def get_provider_status(provider, cfg, state):
+    """Returns (idle_minutes, reset_minutes, tokens_used, used_pct)."""
+    if provider == "claude":
+        return claude_status(cfg, state)
+    if provider == "codex":
+        return codex_status(cfg, state)
+    return None, None, 0, None
+
+
+# ---------------------------------------------------------------------------
+# Backlog parser
+# ---------------------------------------------------------------------------
+
+def parse_task(path):
+    """
+    Parse a backlog .md file.  Expected format:
+
+        # task: my-task-name
+        provider: claude
+        cwd: /path/to/project
+        type: once            # once (default) or recurring
+        allow_writes: true    # optional, default true
+
+        ## system
+        (optional system prompt)
+
+        ## prompt
+        (required: what to do)
+    """
+    text = path.read_text()
+    # Split on ## headings
+    parts  = re.split(r"^##[ \t]+", text, flags=re.MULTILINE)
+    header = parts[0]
+
+    # --- name from first line ---
+    m = re.match(r"^#[ \t]+task:[ \t]*(.+)", header.strip())
+    if not m:
+        return None
+    task = {"name": m.group(1).strip(), "file": path,
+            "allow_writes": True, "type": "once", "max_passes": 3, "model": ""}
+
+    # --- key: value pairs ---
+    for line in header.splitlines()[1:]:
+        if ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        key = key.strip().lower().replace("-", "_")
+        val = val.strip()
+        if key == "provider":
+            task["provider"] = val
+        elif key == "cwd":
+            task["cwd"] = val
+        elif key == "type":
+            task["type"] = val.lower() if val.lower() in ("once", "recurring", "loop") else "once"
+        elif key == "max_passes":
+            try:
+                task["max_passes"] = int(val)
+            except ValueError:
+                pass
+        elif key == "model":
+            task["model"] = val
+        elif key == "allow_writes":
+            task["allow_writes"] = val.lower() not in ("false", "0", "no")
+
+    # --- ## system / ## prompt sections ---
+    for section in parts[1:]:
+        name, _, body = section.partition("\n")
+        name = name.strip().lower()
+        if name in ("system", "prompt"):
+            task[name] = body.strip()
+
+    # Validate
+    if not all(k in task for k in ("name", "provider", "cwd", "prompt")):
+        return None
+    return task
+
+
+def load_backlog():
+    if not BACKLOG_DIR.exists():
+        return []
+    return [t for f in sorted(BACKLOG_DIR.glob("*.md")) if (t := parse_task(f))]
+
+
+# ---------------------------------------------------------------------------
+# Policy
+# ---------------------------------------------------------------------------
+
+def check_eligible(task, idle_minutes, reset_minutes, cfg, state, in_batch=False):
+    """
+    Returns (bool, reason_str).
+
+    in_batch=True: skip idle/cooldown gates (already verified before batch started).
+    Still re-checks reset window and task-specific state (once-done, loop-passes, cwd).
+    """
+    policy = cfg["policy"]
+
+    # once-task already completed?
+    if task["type"] == "once":
+        if task["name"] in state.get("completed_once_tasks", []):
+            return False, "done (once-task completed — use 'reset' to re-run)"
+
+    # loop-task: max passes reached?
+    if task["type"] == "loop":
+        passes = state.get("task_passes", {}).get(task["name"], 0)
+        if passes >= task["max_passes"]:
+            return False, f"loop complete ({passes}/{task['max_passes']} passes — use 'reset' to restart)"
+
+    if not in_batch:
+        # Idle check — two independent gates:
+        #   1. Our own cooldown: quota-burn writes JSONL during tasks, which resets
+        #      idle_minutes to 0 — so we also enforce a hard cooldown on our last run.
+        #   2. User idle: skip if user was genuinely active recently.
+        if idle_minutes is None:
+            return False, "idle unknown (no activity found)"
+
+        last_task_end = state.get("last_run", 0)
+        if last_task_end:
+            time_since_ours = (time.time() - last_task_end) / 60
+            if time_since_ours < policy["idle_threshold_minutes"]:
+                return False, (
+                    f"cooldown ({time_since_ours:.0f}m since last task < "
+                    f"{policy['idle_threshold_minutes']}m threshold)"
+                )
+
+        if idle_minutes < policy["idle_threshold_minutes"]:
+            return False, f"active ({idle_minutes:.0f}m idle < {policy['idle_threshold_minutes']}m threshold)"
+
+    # Reset check — re-evaluated every task so we stop mid-batch if window closes.
+    if reset_minutes is None:
+        return False, "no active usage window (quota already reset)"
+    if reset_minutes > policy["reset_threshold_minutes"]:
+        return False, f"reset not soon ({reset_minutes:.0f}m remaining > {policy['reset_threshold_minutes']}m threshold)"
+
+    # cwd must exist
+    cwd = Path(task["cwd"]).expanduser()
+    if not cwd.exists():
+        return False, f"cwd not found: {cwd}"
+
+    return True, "ok"
+
+
+# ---------------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------------
+
+def build_prompt(task, state):
+    """Assemble the full prompt, injecting loop-iteration context when relevant."""
+    system = task.get("system", "")
+    prompt = task["prompt"]
+
+    if task["type"] == "loop":
+        passes     = state.get("task_passes", {}).get(task["name"], 0)
+        max_passes = task["max_passes"]
+        if passes == 0:
+            iteration_note = f"[Pass 1 of {max_passes} — first run, produce initial output]"
+        else:
+            iteration_note = (
+                f"[Pass {passes + 1} of {max_passes} — this task has run {passes} time(s) before. "
+                f"Review the previous output and improve it. "
+                f"Focus on quality, not just regeneration. "
+                f"Only change what genuinely needs improving.]"
+            )
+        system = f"{iteration_note}\n\n{system}".strip() if system else iteration_note
+
+    if system:
+        return f"[SYSTEM]\n{system}\n\n[TASK]\n{prompt}"
+    return prompt
+
+
+def run_task(task, cfg, state):
+    provider_cfg = cfg["providers"][task["provider"]]
+    binary       = provider_cfg["binary"]
+    cwd          = Path(task["cwd"]).expanduser()
+
+    # Model priority: task-level > provider default_model > provider's own default
+    model = task.get("model") or provider_cfg.get("default_model") or ""
+
+    prompt = build_prompt(task, state)
+
+    if task["provider"] == "claude":
+        cmd = [binary, "--dangerously-skip-permissions", "-p", prompt]
+        if model:
+            cmd += ["--model", model]
+    else:  # codex
+        cmd = [binary, "exec", "--skip-git-repo-check"]
+        if model:
+            cmd += ["--model", model]
+        cmd.append(prompt)
+
+    if not task["allow_writes"] and task["provider"] == "claude":
+        cmd.append("--no-edits")
+
+    log_path = Path(cfg["paths"]["log"]).expanduser()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    ts = datetime.now().isoformat(timespec="seconds")
+    header = f"\n{'─'*60}\n[{ts}] task={task['name']}  cwd={cwd}\n{'─'*60}\n"
+
+    with open(log_path, "a") as log:
+        log.write(header)
+        log.flush()
+        proc = subprocess.run(cmd, cwd=cwd, stdout=log, stderr=log, text=True)
+
+    state.update({
+        "last_run":       time.time(),
+        "last_task":      task["name"],
+        "last_exit_code": proc.returncode,
+    })
+
+    if proc.returncode == 0:
+        # once: mark done
+        if task["type"] == "once":
+            done = state.setdefault("completed_once_tasks", [])
+            if task["name"] not in done:
+                done.append(task["name"])
+        # loop: increment pass counter
+        elif task["type"] == "loop":
+            passes = state.setdefault("task_passes", {})
+            passes[task["name"]] = passes.get(task["name"], 0) + 1
+
+    save_state(state)
+    return proc.returncode
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def cmd_check(cfg, state):
+    tasks = load_backlog()
+
+    # Collect status per provider (lazy, one call per provider)
+    statuses = {}
+    providers_seen = {t["provider"] for t in tasks} or {"claude"}
+    for p in providers_seen:
+        statuses[p] = get_provider_status(p, cfg, state)
+
+    # Print status per provider
+    print("quota-burn status")
+    for p, (idle, reset, tokens, used_pct) in statuses.items():
+        idle_str  = f"{idle:.1f}m"  if idle  is not None else "unknown"
+        reset_str = f"{reset:.0f}m" if reset is not None else "no active window"
+        pct_str   = f"  ({used_pct:.0f}% used)" if used_pct is not None else ""
+        tok_str   = f"  tokens={tokens:,}" if tokens else ""
+        print("─" * 40)
+        print(f"  provider     : {p}")
+        print(f"  idle         : {idle_str}")
+        print(f"  window resets: {reset_str}{pct_str}{tok_str}")
+    print()
+
+    if not tasks:
+        print("  backlog  : (empty — add .md files to backlog/)")
+        return
+
+    print(f"  backlog  : {len(tasks)} task(s)")
+    for task in tasks:
+        idle, reset, _, _ = statuses.get(task["provider"], (None, None, 0, None))
+        ok, reason = check_eligible(task, idle, reset, cfg, state)
+        tag = "ELIGIBLE" if ok else f"skip: {reason}"
+        typ = task["type"]
+        if typ == "once":
+            done   = task["name"] in state.get("completed_once_tasks", [])
+            marker = " ✓" if done else ""
+            label  = f"once{marker}"
+        elif typ == "loop":
+            passes = state.get("task_passes", {}).get(task["name"], 0)
+            label  = f"loop {passes}/{task['max_passes']}"
+        else:
+            label = "recurring"
+        model_str = f", model={task['model']}" if task.get("model") else ""
+        print(f"    [{tag}]")
+        print(f"      {task['name']}  [{label}]  ({task['provider']}{model_str}, cwd={task['cwd']})")
+
+
+def cmd_run_once(cfg, state):
+    lock = acquire_lock()
+    if not lock:
+        print("quota-burn: already running (lock file held)", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        max_tasks = cfg["policy"].get("max_tasks_per_run", 1)
+        tasks     = load_backlog()
+        tasks_run = 0
+        statuses  = {}
+
+        while tasks_run < max_tasks:
+            # Re-fetch provider status each iteration so reset_minutes stays current.
+            # Refresh pings are cached (≥1h), so re-calling is just a fast JSONL scan.
+            statuses = {}
+            ran_one  = False
+
+            for task in tasks:
+                p = task["provider"]
+                if p not in statuses:
+                    statuses[p] = get_provider_status(p, cfg, state)
+                idle, reset, _, _ = statuses[p]
+                in_batch = tasks_run > 0
+                ok, reason = check_eligible(task, idle, reset, cfg, state, in_batch=in_batch)
+                if ok:
+                    n = f"{tasks_run + 1}/{max_tasks}"
+                    print(f"Starting [{n}]: {task['name']}  (cwd={task['cwd']})")
+                    code = run_task(task, cfg, state)
+                    print(f"Done  exit={code}")
+                    tasks_run += 1
+                    ran_one = True
+                    break  # restart scan from top so state changes take effect
+
+            if not ran_one:
+                break  # nothing left to run
+
+        if tasks_run == 0:
+            print("quota-burn: no eligible tasks.")
+            for p, (idle, reset, tokens, pct) in statuses.items():
+                idle_str  = f"{idle:.1f}m"  if idle  is not None else "unknown"
+                reset_str = f"{reset:.0f}m" if reset is not None else "no active window"
+                pct_str   = f"  {pct:.0f}% used" if pct is not None else ""
+                print(f"  [{p}] idle={idle_str}  resets_in={reset_str}{pct_str}")
+        else:
+            log = Path(cfg["paths"]["log"]).expanduser()
+            print(f"quota-burn: ran {tasks_run} task(s).  log={log}")
+    finally:
+        release_lock(lock)
+
+
+# ---------------------------------------------------------------------------
+# done / reset commands
+# ---------------------------------------------------------------------------
+
+def cmd_done(cfg, state):
+    completed = state.get("completed_once_tasks", [])
+    passes    = state.get("task_passes", {})
+    tasks     = load_backlog()
+    loop_tasks = {t["name"]: t["max_passes"] for t in tasks if t["type"] == "loop"}
+
+    if not completed and not passes:
+        print("No tasks completed yet.")
+        return
+
+    if completed:
+        print(f"Completed once-tasks ({len(completed)}):")
+        for name in completed:
+            print(f"  ✓ {name}")
+
+    if passes:
+        print(f"\nLoop-task passes:")
+        for name, n in passes.items():
+            max_p = loop_tasks.get(name, "?")
+            done  = f" — complete" if isinstance(max_p, int) and n >= max_p else ""
+            print(f"  {name}  {n}/{max_p} passes{done}")
+
+    print("\nTo reset a task:  quota-burn reset <task-name>")
+
+
+def cmd_reset(task_name, cfg, state):
+    changed = False
+
+    completed = state.get("completed_once_tasks", [])
+    if task_name in completed:
+        completed.remove(task_name)
+        state["completed_once_tasks"] = completed
+        changed = True
+
+    passes = state.get("task_passes", {})
+    if task_name in passes:
+        del passes[task_name]
+        state["task_passes"] = passes
+        changed = True
+
+    if not changed:
+        print(f"'{task_name}' has no recorded state to reset.")
+        return
+
+    save_state(state)
+    print(f"Reset: '{task_name}' will run again from the beginning.")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    cfg   = load_config()
+    state = load_state()
+
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(__doc__.strip())
+        sys.exit(0)
+
+    cmd = sys.argv[1]
+    if cmd == "check":
+        cmd_check(cfg, state)
+    elif cmd == "run-once":
+        cmd_run_once(cfg, state)
+    elif cmd == "done":
+        cmd_done(cfg, state)
+    elif cmd == "reset":
+        if len(sys.argv) < 3:
+            print("Usage: quota-burn reset <task-name>", file=sys.stderr)
+            sys.exit(1)
+        cmd_reset(sys.argv[2], cfg, state)
+    else:
+        print(f"Unknown command: {cmd!r}", file=sys.stderr)
+        print("Usage: quota-burn check | run-once | done | reset <task>", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
