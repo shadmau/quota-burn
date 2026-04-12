@@ -3,10 +3,12 @@
 quota-burn — spend expiring AI quota on low-priority backlog work.
 
 Usage:
+  quota-burn new             Create a new backlog task interactively
   quota-burn check           Show status: idle, reset time, eligible tasks
   quota-burn run-once        Run exactly one eligible backlog task (if policy allows)
   quota-burn done            List completed once-tasks and loop-task pass counts
   quota-burn reset <task>    Reset a task's state so it can run again
+  quota-burn rm <task>       Delete a backlog task file (and clear its state)
 
 Task types (set in backlog .md files):
   type: once        Run exactly once, then done (default)
@@ -753,6 +755,184 @@ def cmd_reset(task_name, cfg, state):
     print(f"Reset: '{task_name}' will run again from the beginning.")
 
 
+def cmd_rm(task_name, cfg, state):
+    """Delete a backlog task file and wipe its state."""
+    target = BACKLOG_DIR / f"{task_name}.md"
+    if not target.exists():
+        # Maybe they passed the full filename
+        alt = BACKLOG_DIR / task_name
+        if alt.exists():
+            target = alt
+        else:
+            print(f"Task not found: {target}", file=sys.stderr)
+            # Show available tasks
+            tasks = [f.stem for f in sorted(BACKLOG_DIR.glob("*.md"))] if BACKLOG_DIR.exists() else []
+            if tasks:
+                print(f"Available tasks: {', '.join(tasks)}", file=sys.stderr)
+            sys.exit(1)
+
+    confirm = input(f"  Delete '{target.name}'? [y/N]: ").strip().lower()
+    if confirm not in ("y", "yes"):
+        print("Aborted.")
+        sys.exit(0)
+
+    target.unlink()
+    print(f"  Deleted: {target}")
+
+    # Also clear any recorded state for this task
+    name = target.stem
+    changed = False
+    completed = state.get("completed_once_tasks", [])
+    if name in completed:
+        completed.remove(name)
+        state["completed_once_tasks"] = completed
+        changed = True
+    passes = state.get("task_passes", {})
+    if name in passes:
+        del passes[name]
+        state["task_passes"] = passes
+        changed = True
+    if changed:
+        save_state(state)
+        print(f"  State cleared.")
+
+
+# ---------------------------------------------------------------------------
+# Interactive task creator
+# ---------------------------------------------------------------------------
+
+def _ask(prompt, default=None, options=None):
+    """Prompt the user for input with an optional default and choice validation."""
+    hint = ""
+    if options:
+        hint = f" [{'/'.join(options)}]"
+    elif default is not None:
+        hint = f" [{default}]"
+    while True:
+        raw = input(f"  {prompt}{hint}: ").strip()
+        value = raw or (default if default is not None else "")
+        if options and value not in options:
+            print(f"    → pick one of: {', '.join(options)}")
+            continue
+        return value
+
+
+def _ask_multiline(prompt):
+    """Collect multi-line input, terminated by a blank line."""
+    print(f"  {prompt} (blank line to finish):")
+    lines = []
+    while True:
+        line = input("    ")
+        if not line:
+            break
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def cmd_new(cfg):
+    """Interactively create a new backlog task file."""
+    print("quota-burn — new task")
+    print("─" * 40)
+
+    # --- name ---
+    name = _ask("Task name (slug, e.g. add-docstrings)")
+    if not name:
+        print("Aborted: task name is required.")
+        sys.exit(1)
+    name = re.sub(r"[^\w\-]", "-", name).strip("-")
+
+    # Check for duplicate
+    target = BACKLOG_DIR / f"{name}.md"
+    if target.exists():
+        print(f"  ! {target} already exists. Choose a different name or delete it first.")
+        sys.exit(1)
+
+    # --- provider ---
+    providers = sorted(cfg.get("providers", {}).keys()) or ["claude", "codex"]
+    provider  = _ask("Provider", default=providers[0], options=providers)
+
+    # --- cwd ---
+    import os
+    cwd_default = os.getcwd()
+    cwd = _ask("Working directory (cwd)", default=cwd_default)
+    if not Path(cwd).expanduser().exists():
+        print(f"  ! Warning: '{cwd}' does not exist yet.")
+
+    # --- type ---
+    task_type = _ask("Type", default="once", options=["once", "recurring", "loop"])
+
+    # --- max_passes (loop only) ---
+    max_passes = None
+    if task_type == "loop":
+        raw = _ask("Max passes", default="3")
+        try:
+            max_passes = int(raw)
+        except ValueError:
+            max_passes = 3
+
+    # --- model ---
+    default_model = cfg["providers"].get(provider, {}).get("default_model", "")
+    model = _ask(
+        "Model override (leave blank for provider default)",
+        default=default_model or "",
+    )
+
+    # --- allow_writes ---
+    allow_writes_str = _ask("Allow file writes", default="true", options=["true", "false"])
+
+    # --- system prompt ---
+    print()
+    print("  System prompt — optional context for the AI (e.g. 'low-priority work only').")
+    system = _ask_multiline("System prompt")
+
+    # --- prompt ---
+    print()
+    print("  Task prompt — what should the AI actually do?")
+    prompt = _ask_multiline("Prompt")
+    if not prompt:
+        print("Aborted: prompt is required.")
+        sys.exit(1)
+
+    # --- build file content ---
+    lines = [f"# task: {name}"]
+    lines.append(f"provider: {provider}")
+    lines.append(f"cwd: {cwd}")
+    lines.append(f"type: {task_type}")
+    if max_passes is not None:
+        lines.append(f"max_passes: {max_passes}")
+    if model:
+        lines.append(f"model: {model}")
+    lines.append(f"allow_writes: {allow_writes_str}")
+
+    if system:
+        lines.append("")
+        lines.append("## system")
+        lines.append(system)
+
+    lines.append("")
+    lines.append("## prompt")
+    lines.append(prompt)
+    lines.append("")
+
+    content = "\n".join(lines)
+
+    # --- preview ---
+    print()
+    print("─" * 40)
+    print(content)
+    print("─" * 40)
+
+    confirm = input("  Save to backlog? [Y/n]: ").strip().lower()
+    if confirm in ("n", "no"):
+        print("Aborted.")
+        sys.exit(0)
+
+    BACKLOG_DIR.mkdir(exist_ok=True)
+    target.write_text(content)
+    print(f"  Saved: {target}")
+    print(f"  Run 'quota-burn check' to see eligibility.")
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -766,7 +946,9 @@ def main():
         sys.exit(0)
 
     cmd = sys.argv[1]
-    if cmd == "check":
+    if cmd == "new":
+        cmd_new(cfg)
+    elif cmd == "check":
         cmd_check(cfg, state)
     elif cmd == "run-once":
         cmd_run_once(cfg, state)
@@ -777,9 +959,14 @@ def main():
             print("Usage: quota-burn reset <task-name>", file=sys.stderr)
             sys.exit(1)
         cmd_reset(sys.argv[2], cfg, state)
+    elif cmd == "rm":
+        if len(sys.argv) < 3:
+            print("Usage: quota-burn rm <task-name>", file=sys.stderr)
+            sys.exit(1)
+        cmd_rm(sys.argv[2], cfg, state)
     else:
         print(f"Unknown command: {cmd!r}", file=sys.stderr)
-        print("Usage: quota-burn check | run-once | done | reset <task>", file=sys.stderr)
+        print("Usage: quota-burn new | check | run-once | done | reset <task> | rm <task>", file=sys.stderr)
         sys.exit(1)
 
 
