@@ -3,19 +3,20 @@
 Automatically runs low-priority backlog tasks when your AI quota is about to expire.
 
 Monitors the weekly usage windows for Claude and Codex. When the window is closing (< 60 min to reset) and you've been idle for 10+ minutes, it runs queued tasks back-to-back — burning quota that would otherwise be wasted.
+Idle here means observed inactivity from repeated live quota checks, not a local session timestamp.
 
 ## How it works
 
 ```
 cron (every 10 min)
   └── quota-burn run-once
-        ├── fetch rate limits from API  (Claude: Anthropic API headers, Codex: JSONL from CLI)
-        ├── check idle (JSONL timestamps)
+        ├── fetch live status  (Claude: Anthropic API headers, Codex: minimal CLI probe)
+        ├── compare used % with previous probe
         ├── policy: reset < 60 min AND idle > 10 min?
         └── run up to max_tasks_per_run tasks sequentially
 ```
 
-Reset times come directly from the provider APIs — rolling windows, matches exactly what you see in the web UI.
+Reset times come from live provider status. Claude matches the provider API directly; Codex comes from the fresh CLI probe's emitted rate-limit metadata.
 
 ## Setup
 
@@ -29,16 +30,19 @@ chmod +x quota-burn
 ```toml
 [policy]
 reset_threshold_minutes = 60   # trigger window before reset
-idle_threshold_minutes  = 10   # skip if you've been active recently
+idle_threshold_minutes  = 10   # skip unless live probes show inactivity this long
 max_tasks_per_run       = 3    # tasks per cron invocation
 
 [providers.claude]
 binary        = "claude"
 refresh_model = "claude-haiku-4-5-20251001"
+activity_epsilon_pct = 0.1
 
 [providers.codex]
 binary        = "codex"
+sessions_dir  = "~/.codex/sessions"
 refresh_model = "gpt-5.4-mini"
+activity_epsilon_pct = 0.1
 ```
 
 **3. Add tasks** (`backlog/my-task.md`)
@@ -82,16 +86,16 @@ quota-burn reset <name>   # re-queue a once/loop task
 
 ## Provider support
 
-**Claude** — reads idle from `~/.claude/projects/**/*.jsonl`, fetches reset time directly from `api.anthropic.com` rate limit headers. Requires Claude CLI (`claude`).
+**Claude** — every check sends a minimal live API request using the Claude CLI OAuth token. The reset window comes from the account-wide 7d utilization (so we burn quota right before it expires), while observed idle is derived from changes in the 5h utilization (more responsive to actual user activity). Requires Claude CLI auth.
 
-**Codex** — reads idle and reset time from `~/.codex/sessions/**/*.jsonl` (written by the Codex CLI after each call). If data is stale (Cursor extension users), fires a minimal refresh ping. Requires Codex CLI (`codex`).
+**Codex** — every check sends a minimal `codex exec` probe, reads the resulting `rate_limits` from that probe's session JSONL, then derives observed idle from changes in the account-wide weekly utilization. Requires Codex CLI (`codex`).
 
 ## Idle detection
 
-Idle is checked per provider. A hard cooldown also prevents back-to-back runs if quota-burn itself was active recently (its own JSONL writes would otherwise reset the idle clock).
+Idle is checked per provider from live usage drift between probes. A hard cooldown also prevents back-to-back runs if quota-burn itself was active recently.
 
 ```
-effective_idle = provider idle AND time since our last task > threshold
+effective_idle = observed provider idle AND time since our last task > threshold
 ```
 
 ## File structure

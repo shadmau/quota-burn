@@ -35,8 +35,6 @@ LOCK_FILE   = SCRIPT_DIR / ".lock"
 # Config
 # ---------------------------------------------------------------------------
 
-WINDOW_DAYS = 7  # Claude's rolling weekly usage window (7 × 24h)
-
 DEFAULTS = {
     "policy": {
         "reset_threshold_minutes": 60,
@@ -46,16 +44,16 @@ DEFAULTS = {
     "providers": {
         "claude": {
             "binary":           "claude",
-            "projects_dir":     "~/.claude/projects",
-            "plan_token_limit": 0,
             "refresh_model":    "claude-haiku-4-5-20251001",
             "default_model":    "",
+            "activity_epsilon_pct": 0.1,
         },
         "codex": {
             "binary":        "codex",
             "sessions_dir":  "~/.codex/sessions",
             "refresh_model": "gpt-5.4-mini",  # cheapest Codex model for the ping
             "default_model": "",              # leave empty = provider default (gpt-5.4)
+            "activity_epsilon_pct": 0.1,
         },
     },
     "paths": {
@@ -98,10 +96,15 @@ def load_config():
 def load_state():
     if STATE_FILE.exists():
         try:
-            return json.loads(STATE_FILE.read_text())
+            state = json.loads(STATE_FILE.read_text())
+            if isinstance(state, dict):
+                state.pop("claude_rl_cache", None)
+                state.pop("codex_refresh_ts", None)
+                state.setdefault("provider_activity", {})
+                return state
         except Exception:
             pass
-    return {}
+    return {"provider_activity": {}}
 
 
 def save_state(state):
@@ -129,10 +132,62 @@ def release_lock(fh):
 
 
 # ---------------------------------------------------------------------------
-# Claude provider  — idle from JSONL, reset/utilization from Anthropic API
+# Provider activity tracking — observed idle from live usage drift
 # ---------------------------------------------------------------------------
 
-CLAUDE_RL_CACHE_MAX_AGE = 3600  # re-fetch rate limits at most once per hour
+def _activity_epsilon_pct(cfg, provider):
+    return float(cfg["providers"].get(provider, {}).get("activity_epsilon_pct", 0.1) or 0.0)
+
+
+def _update_observed_idle(provider, used_pct, resets_at, cfg, state):
+    """
+    Track observed idle per provider from live used_pct snapshots.
+
+    We do not know the exact last request time across machines. Instead, we
+    treat unchanged quota utilization between probes as "observed idle".
+    """
+    if used_pct is None:
+        return None
+
+    now = time.time()
+    provider_activity = state.setdefault("provider_activity", {})
+    activity = provider_activity.setdefault(provider, {})
+
+    previous_used = activity.get("last_used_pct")
+    previous_reset = activity.get("last_resets_at")
+    observed_idle_since = activity.get("observed_idle_since")
+    epsilon = _activity_epsilon_pct(cfg, provider)
+
+    if previous_used is None:
+        observed_idle_since = now
+    else:
+        usage_reset = (
+            previous_reset is not None
+            and resets_at is not None
+            and resets_at > previous_reset
+            and used_pct < (previous_used - epsilon)
+        )
+        significant_increase = used_pct > (previous_used + epsilon)
+
+        if usage_reset or significant_increase:
+            observed_idle_since = now
+        elif observed_idle_since is None:
+            observed_idle_since = activity.get("last_probe_at", now)
+
+    activity.update({
+        "last_probe_at": now,
+        "last_used_pct": used_pct,
+        "last_resets_at": resets_at,
+        "observed_idle_since": observed_idle_since,
+    })
+    save_state(state)
+
+    return max(0.0, (now - observed_idle_since) / 60)
+
+
+# ---------------------------------------------------------------------------
+# Claude provider  — live account status via Anthropic API
+# ---------------------------------------------------------------------------
 
 def _fetch_claude_rate_limits(cfg):
     """
@@ -186,13 +241,13 @@ def _fetch_claude_rate_limits(cfg):
     r5h = hget("anthropic-ratelimit-unified-5h-reset")
     u5h = hget("anthropic-ratelimit-unified-5h-utilization")
 
-    if not r7d:
+    if not r7d or not r5h:
         return None
 
     return {
         "resets_at_7d": int(r7d),
         "util_7d":      float(u7d) if u7d else None,
-        "resets_at_5h": int(r5h)   if r5h else None,
+        "resets_at_5h": int(r5h),
         "util_5h":      float(u5h) if u5h else None,
     }
 
@@ -201,172 +256,192 @@ def claude_status(cfg, state):
     """
     Returns (idle_minutes, reset_minutes, tokens_used, used_pct).
 
-    idle_minutes : from JSONL timestamps — accurate, works offline.
-    reset_minutes: from Anthropic API headers — exact, matches web UI.
-                   Cached in state for up to 1 hour.
-    used_pct     : API-reported 7d utilization (0–100 %).
+    Every check performs a fresh API call. Reset window is tracked from the
+    account-wide 7d utilization (so we burn quota right before it expires),
+    while idle is derived from changes in the 5h utilization between probes
+    (more responsive to actual user activity).
     """
-    projects = Path(cfg["providers"]["claude"]["projects_dir"]).expanduser()
     now = time.time()
+    print("  [claude] fetching live rate limits from API...", file=sys.stderr)
+    rl = _fetch_claude_rate_limits(cfg)
+    if not rl:
+        return None, None, 0, None
 
-    # --- Idle detection: scan JSONL for most recent message timestamp ---
-    latest_ts   = 0.0
-    tokens_used = 0
-    window_start = now - WINDOW_DAYS * 24 * 3600
-
-    if projects.exists():
-        for f in projects.rglob("*.jsonl"):
-            if f.stat().st_mtime < window_start - 86400:
-                continue
-            try:
-                for raw in f.read_text(errors="replace").splitlines():
-                    if not raw.strip():
-                        continue
-                    obj = json.loads(raw)
-                    ts_str = obj.get("timestamp")
-                    if not ts_str:
-                        continue
-                    ts = datetime.fromisoformat(
-                        ts_str.replace("Z", "+00:00")
-                    ).timestamp()
-                    if ts > latest_ts:
-                        latest_ts = ts
-                    if ts >= window_start:
-                        usage = obj.get("message", {}).get("usage", {})
-                        if usage:
-                            tokens_used += (
-                                usage.get("input_tokens", 0)
-                                + usage.get("output_tokens", 0)
-                                + usage.get("cache_creation_input_tokens", 0)
-                            )
-            except Exception:
-                continue
-
-    idle_minutes = (now - latest_ts) / 60 if latest_ts else None
-
-    # --- Rate limits: API (cached hourly) ---
-    cache = state.get("claude_rl_cache", {})
-    if now - cache.get("ts", 0) > CLAUDE_RL_CACHE_MAX_AGE:
-        print("  [claude] fetching rate limits from API...", file=sys.stderr)
-        rl = _fetch_claude_rate_limits(cfg)
-        if rl:
-            cache = {"ts": now, **rl}
-            state["claude_rl_cache"] = cache
-            save_state(state)
-
-    resets_at_7d = cache.get("resets_at_7d")
-    util_7d      = cache.get("util_7d")
+    resets_at_7d = rl.get("resets_at_7d")
+    resets_at_5h = rl.get("resets_at_5h")
+    util_5h      = rl.get("util_5h")
+    used_pct = util_5h * 100 if util_5h is not None else None
+    idle_minutes = _update_observed_idle("claude", used_pct, resets_at_5h, cfg, state)
 
     if not resets_at_7d or resets_at_7d <= now:
-        return idle_minutes, None, tokens_used, None
+        return idle_minutes, None, 0, used_pct
 
-    reset_minutes = (resets_at_7d - now) / 60
-    used_pct      = util_7d * 100 if util_7d is not None else None
-
-    return idle_minutes, reset_minutes, tokens_used, used_pct
+    return idle_minutes, (resets_at_7d - now) / 60, 0, used_pct
 
 
 # ---------------------------------------------------------------------------
-# Codex provider
+# Codex provider — live CLI probe, rate limits read from current probe output
 # ---------------------------------------------------------------------------
 
-CODEX_SESSION_MAX_AGE = 3600  # re-use session data if < 1h old
-
-def _codex_read_sessions(sessions_dir):
+def _jsonl_objects(path):
     """
-    Scan ~/.codex/sessions/**/*.jsonl for the most recent token_count event.
-    Returns (latest_event_ts, best_rate_limits, best_event_ts).
+    Yield parsed JSONL objects, skipping malformed lines.
     """
-    now = time.time()
-    latest_event_ts  = 0.0
-    best_rate_limits = None
-    best_event_ts    = 0.0
-
-    files = sorted(sessions_dir.rglob("*.jsonl"),
-                   key=lambda f: f.stat().st_mtime, reverse=True)
-
-    for f in files:
-        if f.stat().st_mtime < now - 8 * 86400:
-            break
-        try:
-            for raw in f.read_text(errors="replace").splitlines():
-                if not raw.strip():
-                    continue
-                obj = json.loads(raw)
-                ts_str = obj.get("timestamp")
-                if not ts_str:
-                    continue
-                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
-                if ts > latest_event_ts:
-                    latest_event_ts = ts
-                payload = obj.get("payload", {})
-                if isinstance(payload, dict) and payload.get("type") == "token_count":
-                    rl = payload.get("rate_limits")
-                    if rl and ts > best_event_ts:
-                        best_event_ts    = ts
-                        best_rate_limits = rl
-        except Exception:
-            continue
-        if best_rate_limits and (now - best_event_ts) < 8 * 86400:
-            break
-
-    return latest_event_ts, best_rate_limits, best_event_ts
+    try:
+        for raw in path.read_text(errors="replace").splitlines():
+            if not raw.strip():
+                continue
+            try:
+                yield json.loads(raw)
+            except Exception:
+                continue
+    except Exception:
+        return
 
 
-def _run_hello(binary, extra_args, model=None, cwd="/tmp"):
+def _parse_ts(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def _run_probe(binary, extra_args, prompt, model=None, cwd="/tmp"):
     """
-    Fire a minimal CLI request to get a fresh session file with rate_limits.
-    Uses the cheapest configured model and the shortest possible prompt.
+    Fire a minimal CLI request.
     """
     cmd = [binary] + extra_args
     if model:
         cmd += ["--model", model]
-    cmd += ["hi"]   # 1 token — minimum viable prompt
+    cmd += [prompt]
     try:
-        subprocess.run(cmd, capture_output=True, text=True, timeout=30, cwd=cwd)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, cwd=cwd)
+        return proc.returncode == 0
     except Exception:
-        pass
+        return False
+
+
+def _codex_changed_session_files(sessions_dir, before_mtimes):
+    changed = []
+    for path in sessions_dir.rglob("*.jsonl"):
+        try:
+            mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            continue
+        old_mtime_ns = before_mtimes.get(str(path))
+        if old_mtime_ns is None or mtime_ns > old_mtime_ns:
+            changed.append((mtime_ns, path))
+    changed.sort(reverse=True)
+    return [path for _, path in changed]
+
+
+def _codex_probe_rate_limits_from_file(path, marker):
+    marker_ts = None
+    best_rate_limits = None
+    best_ts = 0.0
+
+    for obj in _jsonl_objects(path):
+        ts = _parse_ts(obj.get("timestamp"))
+        if ts is None:
+            continue
+
+        payload = obj.get("payload", {})
+        if isinstance(payload, dict) and payload.get("type") == "user_message":
+            if payload.get("message") == marker:
+                marker_ts = ts
+            continue
+
+        if marker_ts is None or ts < marker_ts:
+            continue
+
+        if isinstance(payload, dict) and payload.get("type") == "token_count":
+            rate_limits = payload.get("rate_limits")
+            if rate_limits and ts >= best_ts:
+                best_rate_limits = rate_limits
+                best_ts = ts
+
+    return best_rate_limits, best_ts
+
+
+def _codex_latest_rate_limits_from_file(path):
+    best_rate_limits = None
+    best_ts = 0.0
+    for obj in _jsonl_objects(path):
+        ts = _parse_ts(obj.get("timestamp"))
+        if ts is None:
+            continue
+        payload = obj.get("payload", {})
+        if isinstance(payload, dict) and payload.get("type") == "token_count":
+            rate_limits = payload.get("rate_limits")
+            if rate_limits and ts >= best_ts:
+                best_rate_limits = rate_limits
+                best_ts = ts
+    return best_rate_limits, best_ts
+
+
+def _fetch_codex_rate_limits(cfg):
+    """
+    Trigger a fresh Codex CLI turn and read the resulting rate_limits from the
+    session JSONL written by that specific probe.
+    """
+    sessions_dir = Path(cfg["providers"]["codex"]["sessions_dir"]).expanduser()
+    if not sessions_dir.exists():
+        return None
+
+    before_mtimes = {}
+    for path in sessions_dir.rglob("*.jsonl"):
+        try:
+            before_mtimes[str(path)] = path.stat().st_mtime_ns
+        except OSError:
+            continue
+
+    marker = f"quota-burn-status-probe:{int(time.time() * 1000)}"
+    print("  [codex] fetching live rate limits via CLI probe...", file=sys.stderr)
+    ok = _run_probe(
+        cfg["providers"]["codex"]["binary"],
+        ["exec", "--skip-git-repo-check"],
+        prompt=marker,
+        model=cfg["providers"]["codex"].get("refresh_model"),
+    )
+    if not ok:
+        return None
+
+    for _ in range(6):
+        changed_files = _codex_changed_session_files(sessions_dir, before_mtimes)
+
+        for path in changed_files:
+            rate_limits, _ = _codex_probe_rate_limits_from_file(path, marker)
+            if rate_limits:
+                return rate_limits
+
+        for path in changed_files:
+            rate_limits, _ = _codex_latest_rate_limits_from_file(path)
+            if rate_limits:
+                return rate_limits
+
+        time.sleep(0.5)
+
+    return None
 
 
 def codex_status(cfg, state):
     """
     Returns (idle_minutes, reset_minutes, tokens_used, used_pct).
 
-    If session data is stale (> CODEX_SESSION_MAX_AGE), fires a minimal
-    `codex exec` to refresh it — at most once per hour (tracked in state).
+    Every check performs a fresh Codex CLI probe. Idle is derived from changes
+    in the weekly used_percent between probes, not from local session history.
     """
-    sessions_dir = Path(cfg["providers"]["codex"]["sessions_dir"]).expanduser()
-    if not sessions_dir.exists():
+    now = time.time()
+    rate_limits = _fetch_codex_rate_limits(cfg)
+    if not rate_limits:
         return None, None, 0, None
 
-    now = time.time()
-    latest_ts, best_rl, best_ts = _codex_read_sessions(sessions_dir)
-
-    data_age = now - best_ts if best_ts else float("inf")
-
-    if data_age > CODEX_SESSION_MAX_AGE:
-        last_refresh = state.get("codex_refresh_ts", 0)
-        if now - last_refresh > CODEX_SESSION_MAX_AGE:
-            print("  [codex] session data stale — running minimal refresh...",
-                  file=sys.stderr)
-            _run_hello(
-                cfg["providers"]["codex"]["binary"],
-                ["exec", "--skip-git-repo-check"],
-                model=cfg["providers"]["codex"].get("refresh_model"),
-            )
-            state["codex_refresh_ts"] = now
-            save_state(state)
-            # Re-read after refresh
-            latest_ts, best_rl, best_ts = _codex_read_sessions(sessions_dir)
-
-    idle_minutes = (now - latest_ts) / 60 if latest_ts else None
-
-    if not best_rl:
-        return idle_minutes, None, 0, None
-
-    secondary = best_rl.get("secondary", {})
+    secondary = rate_limits.get("secondary", {})
     resets_at = secondary.get("resets_at")
     used_pct  = secondary.get("used_percent")
+    idle_minutes = _update_observed_idle("codex", used_pct, resets_at, cfg, state)
 
     if not resets_at or resets_at <= now:
         return idle_minutes, None, 0, 0.0
@@ -487,11 +562,12 @@ def check_eligible(task, idle_minutes, reset_minutes, cfg, state, in_batch=False
 
     if not in_batch:
         # Idle check — two independent gates:
-        #   1. Our own cooldown: quota-burn writes JSONL during tasks, which resets
-        #      idle_minutes to 0 — so we also enforce a hard cooldown on our last run.
-        #   2. User idle: skip if user was genuinely active recently.
+        #   1. Our own cooldown: quota-burn's own task runs also consume provider quota,
+        #      so we always enforce a hard cooldown on our last run.
+        #   2. Observed user idle: only run after live probes show no meaningful
+        #      quota movement for long enough.
         if idle_minutes is None:
-            return False, "idle unknown (no activity found)"
+            return False, "idle unknown (live status unavailable)"
 
         last_task_end = state.get("last_run", 0)
         if last_task_end:
@@ -503,7 +579,10 @@ def check_eligible(task, idle_minutes, reset_minutes, cfg, state, in_batch=False
                 )
 
         if idle_minutes < policy["idle_threshold_minutes"]:
-            return False, f"active ({idle_minutes:.0f}m idle < {policy['idle_threshold_minutes']}m threshold)"
+            return False, (
+                f"active ({idle_minutes:.0f}m observed idle < "
+                f"{policy['idle_threshold_minutes']}m threshold)"
+            )
 
     # Reset check — re-evaluated every task so we stop mid-batch if window closes.
     if reset_minutes is None:
@@ -611,7 +690,7 @@ def cmd_check(cfg, state):
 
     # Collect status per provider (lazy, one call per provider)
     statuses = {}
-    providers_seen = {t["provider"] for t in tasks} or {"claude"}
+    providers_seen = set(cfg.get("providers", {}).keys()) or {"claude"}
     for p in providers_seen:
         statuses[p] = get_provider_status(p, cfg, state)
 
@@ -624,7 +703,7 @@ def cmd_check(cfg, state):
         tok_str   = f"  tokens={tokens:,}" if tokens else ""
         print("─" * 40)
         print(f"  provider     : {p}")
-        print(f"  idle         : {idle_str}")
+        print(f"  observed idle: {idle_str}")
         print(f"  window resets: {reset_str}{pct_str}{tok_str}")
     print()
 
@@ -665,8 +744,8 @@ def cmd_run_once(cfg, state):
         statuses  = {}
 
         while tasks_run < max_tasks:
-            # Re-fetch provider status each iteration so reset_minutes stays current.
-            # Refresh pings are cached (≥1h), so re-calling is just a fast JSONL scan.
+            # Re-fetch provider status each iteration so reset_minutes stays current
+            # and observed idle keeps advancing from live probes.
             statuses = {}
             ran_one  = False
 

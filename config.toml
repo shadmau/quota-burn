@@ -1,20 +1,20 @@
 [policy]
-reset_threshold_minutes = 60   # run if weekly window resets within this many minutes
-idle_threshold_minutes  = 10   # only run if Claude has been idle this long
+reset_threshold_minutes = 60   # run if weekly (7d) window resets within this many minutes
+idle_threshold_minutes  = 10   # only run after this much observed inactivity
 max_tasks_per_run       = 3    # tasks to run back-to-back per cron invocation (1 = old behaviour)
 
 [providers.claude]
 binary        = "claude"
-projects_dir  = "~/.claude/projects"
 refresh_model = "claude-haiku-4-5-20251001"  # model used for API rate-limit ping (cheapest)
 default_model = ""                           # task default — empty = claude's own default (sonnet)
-# plan_token_limit = 35000                   # uncomment for token % display (Max $100 ~5x Pro)
+activity_epsilon_pct = 0.1                   # ignore smaller used-% moves when estimating idle
 
 [providers.codex]
 binary         = "codex"
 sessions_dir   = "~/.codex/sessions"
-refresh_model  = "gpt-5.4-mini"              # ping model — cheapest available Codex model
-default_model  = ""                           # task default — empty = codex's own default (gpt-5.4)
+refresh_model  = "gpt-5.4-mini"              # probe model — cheapest available Codex model
+default_model  = ""                          # task default — empty = codex's own default (gpt-5.4)
+activity_epsilon_pct = 0.1                   # ignore smaller used-% moves when estimating idle
 
 [paths]
 log = "~/.quota-burn/run.log"
